@@ -24,15 +24,19 @@ class Pilot(object):
 
 class Harvester(Pilot):
     Role = "HARVESTER"
-    StateHarvest = "HARVEST"
-    StateDeposit = "DEPOSIT"
+    StatusSearch = "SEARCH"
+    StatusHarvest = "HARVEST"
+    StatusDeposit = "DEPOSIT"
+    StatusRunback = "RUNBACK"
+    StatusLeave = "LEAVING"
 
     def __init__(self, ai, ship):
         super(Harvester, self).__init__(ai, ship)
         self.status = "INACTIVE"
         self.log("{} Pilot assigned to ship".format(Harvester.Role))
-        self.status = Harvester.StateHarvest
+        self.status = Harvester.StatusSearch
         self.role = Harvester.Role
+        self.target = self.ai.shipyard().position
 
     def log(self, s):
         super(Harvester, self).log("[{}] {}".format(self.status, s))
@@ -40,7 +44,9 @@ class Harvester(Pilot):
     def getHalitestNeighbor(self, ship):
         halitest = ship.position
         map = self.ai.map()
-        for neighbor in ship.position.get_surrounding_cardinals():
+        neighbors = ship.position.get_surrounding_cardinals()
+        random.shuffle(neighbors)
+        for neighbor in neighbors:
             if map[neighbor].halite_amount > map[halitest].halite_amount:
                 halitest = neighbor
         return halitest
@@ -51,16 +57,28 @@ class Harvester(Pilot):
         closest = (None, 0)
         for dropoff in self.ai.dropoffs:
             dist = map.calculate_distance(source, dropoff)
-            if closest[0] == None or closest[1] > dist:
+            if closest[0] is None or closest[1] > dist:
                 closest = (dropoff, dist)
         return closest[0]
 
     def shouldBuild(self, ship):
-        return (self.status == Harvester.StateDeposit and self.static > 5 and
-                self.ai.me().halite_amount >= constants.DROPOFF_COST)
+        should = (self.status == Harvester.StatusDeposit and self.static > 5)
+        can = self.ai.current_halite >= constants.DROPOFF_COST
 
-    def harvest(self, ship):
-        self.log("Harvesting; collected halite: {}".format(ship.halite_amount))
+        closest = self.getClosestDropoff(ship)
+        map = self.ai.map()
+        dist = map.calculate_distance(ship.position, closest)
+        worth = dist > self.static
+        return can and should and worth and not self.ai.noMoreCosts
+
+    def amOnTime(self, ship):
+        map = self.ai.map()
+        closest = self.getClosestDropoff(ship)
+        distance = map.calculate_distance(ship.position, closest)
+        return distance*2 <= constants.MAX_TURNS - self.ai.turn()
+
+    def search(self, ship):
+        self.log("Searching; collected halite: {}".format(ship.halite_amount))
         map = self.ai.map()
         shipyard = self.ai.shipyard()
 
@@ -72,6 +90,13 @@ class Harvester(Pilot):
             return ship.move(order)
 
     def step(self, ship):
+        if (not self.amOnTime(ship) and self.status != Harvester.StatusRunback
+            and self.status != Harvester.StatusLeave):
+            self.ai.noMoreCosts = True
+            self.status = Harvester.StatusRunback
+            self.target = self.getClosestDropoff(ship)
+            self.log("Initiating runback")
+
         if ship.position == self.lastPos:
             self.static += 1
         else:
@@ -79,35 +104,66 @@ class Harvester(Pilot):
             self.lastPos = ship.position
 
         if self.shouldBuild(ship):
+            self.log("Bulding Dropoff point")
             self.ai.addDropoff(ship.position)
+            self.ai.current_halite -= constants.DROPOFF_COST
             return ship.make_dropoff()
 
         map = self.ai.map()
         shipyard = self.ai.shipyard()
-        # Status is returning to deposit halite on a dropoff point
-        if self.status == Harvester.StateDeposit:
+        # Status is runback, last deposit run
+        if self.status == Harvester.StatusRunback:
             # Deposited successfully
-            if ship.position == self.ai.shipyard().position:
-                self.log("Halite has been deposited")
-                self.status = Harvester.StateHarvest
+            if ship.position == self.target:
+                self.log("Halite has been deposited one last time")
+                self.status = Harvester.StatusLeave
+                self.target = random.choice(self.ai.enemyShipyards()).position
+                self.target = map.normalize(self.target)
             # Still travelling to dropoff point
             else:
                 if self.ai.newDropoffs:
-                    self.dropoff = self.getClosestDropoff(ship)
-                order = map.naive_navigate(ship, self.dropoff)
+                    self.target = self.getClosestDropoff(ship)
+                order = map.naive_navigate(ship, self.target)
                 return ship.move(order)
-        # Status is harvesting halite; halite exceeds criteria for dropoff
-        elif ship.halite_amount >= constants.MAX_HALITE / 2:
-            if map[ship.position].halite_amount > 0 and ship.halite_amount < constants.MAX_HALITE:
-                self.log("Finishing halite harvest")
+        # Make way for other Runbacks
+        if self.status == self.StatusLeave:
+            order = map.get_unsafe_moves(ship.position, self.target)[0]
+            return ship.move(order)
+        # Status is returning to deposit halite on a dropoff point
+        if self.status == Harvester.StatusDeposit:
+            # Deposited successfully
+            if ship.position == self.target:
+                self.log("Halite has been deposited")
+                self.status = Harvester.StatusSearch
+            # Still travelling to dropoff point
+            else:
+                if self.ai.newDropoffs:
+                    self.target = self.getClosestDropoff(ship)
+                order = map.naive_navigate(ship, self.target)
+                return ship.move(order)
+        # Status is searching for halite
+        elif self.status == Harvester.StatusSearch:
+            order = self.search(ship)
+            if (order == Direction.Still or
+                ship.halite_amount + map[ship.position].halite_amount > constants.MAX_HALITE * 3/4):
+                self.log("Stopping to harvest halite")
+                self.status = Harvester.StatusHarvest
                 return ship.stay_still()
-            self.log("Returning to deposit collected halite: {}"
-                     .format(ship.halite_amount))
-            self.status = Harvester.StateDeposit
-            self.dropoff = self.getClosestDropoff(ship)
-        # Status is harvesting halite
-        else:
-            return self.harvest(ship)
+            else:
+                return order
+        # Status is harvesting halite in current tile
+        elif self.status == Harvester.StatusHarvest:
+            # Enough to go to deposit halite
+            if ship.halite_amount >= constants.MAX_HALITE*2 / 3:
+                self.log("Returning to deposit collected halite: {}"
+                         .format(ship.halite_amount))
+                self.status = Harvester.StatusDeposit
+                self.target = self.getClosestDropoff(ship)
+                return ship.stay_still()
+            # Not enough to go deposit halite
+            elif map[ship.position].halite_amount <= 0:
+                self.status = Harvester.StatusSearch
+                return self.setp(ship)
         return ship.stay_still()
 
 class Brain(object):
@@ -120,6 +176,8 @@ class Brain(object):
         self.noEnemiesCheck = (game.turn_number, False)
         self.dropoffs = [game.me.shipyard.position]
         self.newDropoffs = False
+        self.noMoreCosts = False
+        self.current_halite = game.me.halite_amount
 
         self.enemies = {}
         for key, player in game.players.items():
@@ -142,6 +200,9 @@ class Brain(object):
     def shipyard(self):
         return self.game.me.shipyard
 
+    def enemyShipyards(self):
+        return [self.enemies[pid].shipyard for pid in self.enemies]
+
     def addDropoff(self, pos):
         self.newDropoffs = True
         self.dropoffs.append(pos)
@@ -149,11 +210,11 @@ class Brain(object):
     def canSpawn(self):
         me = self.me()
         map = self.map()
-        return me.halite_amount >= constants.SHIP_COST and not map[me.shipyard].is_occupied
+        return self.current_halite >= constants.SHIP_COST and not map[me.shipyard].is_occupied
 
     def shouldSpawn(self):
-        rate = random.expovariate(self.game.turn_number / 15)
-        return self.turn() <= 1 or random.random() <= rate
+        rate = random.expovariate(self.game.turn_number / 20)
+        return not self.noMoreCosts and (self.turn() <= 1 or random.random() <= rate)
 
     def tailingSpawn(self):
         bestPlayer = None
@@ -169,6 +230,7 @@ class Brain(object):
         me = self.me()
         map = self.map()
         shipyard = self.shipyard()
+        self.current_halite = me.halite_amount
 
         # A command queue holds all the commands you will run this turn.
         commands = []
@@ -184,6 +246,7 @@ class Brain(object):
         # If you're on the first turn and have enough halite, spawn a ship.
         # Don't spawn a ship if you currently have a ship at port, though.
         if self.canSpawn() and self.shouldSpawn():
+            self.current_halite -= constants.SHIP_COST
             commands.append(shipyard.spawn())
 
         # Send your moves back to the game environment, ending this turn.
